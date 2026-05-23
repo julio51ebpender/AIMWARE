@@ -1,0 +1,718 @@
+local DB_FILE = "grief_tracker_db.txt"
+
+local RH = 22
+local Y0 = 6
+
+local wnd = gui.Window("gt_wnd", "Grief Tracker", 140, 140, 300, 175)
+
+local function row(ctrl, n)
+    ctrl:SetPosY(Y0 + n * RH)
+    ctrl:SetPosX(8)
+    return ctrl
+end
+
+local gt_on = row(gui.Checkbox(wnd, "gt_on", "Enable", false), 0)
+local gt_x  = row(gui.Slider(wnd, "gt_x", "Table X", 1300, 0, 3840, 1), 1)
+local gt_y  = row(gui.Slider(wnd, "gt_y", "Table Y", 30, 0, 2160, 1), 2)
+
+local DB = {}
+local SEEN_PLAYERS = {}
+local SEEN_ORDER = {}
+local TEAM_HP = {}
+local LAST_LOCAL_TEAM = 0
+local freeze_end_time = 0.0
+
+local menu = gui.Reference("MENU")
+local font = draw.CreateFont("Verdana", 13, 400)
+
+local bit_band = nil
+if bit and bit.band then
+    bit_band = bit.band
+elseif bit32 and bit32.band then
+    bit_band = bit32.band
+end
+
+local function clamp(v, a, b)
+    if v < a then return a end
+    if v > b then return b end
+    return v
+end
+
+local function realtime()
+    local ok, v = pcall(function() return globals.RealTime() end)
+    if ok and type(v) == "number" then return v end
+
+    ok, v = pcall(function() return common.Time() end)
+    if ok and type(v) == "number" then return v end
+
+    return 0
+end
+
+local function sanitize_name(s)
+    s = tostring(s or "")
+    s = s:gsub("[\r\n\t]", " ")
+    return s
+end
+
+local function save_db()
+    local out = {}
+    for name, st in pairs(DB) do
+        local dmg = tonumber(st.dmg) or 0
+        local kills = tonumber(st.kills) or 0
+        out[#out + 1] = sanitize_name(name) .. "\t" .. tostring(dmg) .. "\t" .. tostring(kills)
+    end
+    file.Write(DB_FILE, table.concat(out, "\n"))
+end
+
+local function load_db()
+    DB = {}
+
+    local data = nil
+    local ok, res = pcall(function() return file.Read(DB_FILE) end)
+    if ok then
+        data = res
+    end
+
+    if not data or data == "" then
+        return
+    end
+
+    for line in string.gmatch(data, "[^\r\n]+") do
+        local name, dmg, kills = line:match("^(.-)\t(-?%d+)\t(-?%d+)$")
+        if name then
+            DB[name] = {
+                dmg = tonumber(dmg) or 0,
+                kills = tonumber(kills) or 0
+            }
+        end
+    end
+end
+
+local function clear_db()
+    DB = {}
+    pcall(function() file.Delete(DB_FILE) end)
+end
+
+local function clear_seen()
+    SEEN_PLAYERS = {}
+    SEEN_ORDER = {}
+end
+
+local function clear_team_hp()
+    TEAM_HP = {}
+end
+
+local gt_clear = row(gui.Button(wnd, "Clear Data", function()
+    clear_db()
+    clear_seen()
+    clear_team_hp()
+end), 3)
+
+load_db()
+
+local function safe_getint(event, key)
+    local ok, val = pcall(function() return event:GetInt(key) end)
+    if ok and type(val) == "number" then
+        return val
+    end
+    return 0
+end
+
+local function get_ent_index(ent)
+    if not ent then return 0 end
+    local ok, idx = pcall(function() return ent:GetIndex() end)
+    if ok and type(idx) == "number" then
+        return idx
+    end
+    return 0
+end
+
+local function get_team(ent)
+    if not ent then return 0 end
+
+    local ok, v = pcall(function() return ent:GetPropInt("m_iTeamNum") end)
+    if ok and type(v) == "number" and v ~= 0 then
+        return v
+    end
+
+    ok, v = pcall(function() return ent:GetTeamNumber() end)
+    if ok and type(v) == "number" then
+        return v
+    end
+
+    return 0
+end
+
+local function get_health(ent)
+    if not ent then return 0 end
+
+    local ok, v = pcall(function() return ent:GetPropInt("m_iHealth") end)
+    if ok and type(v) == "number" then
+        return clamp(v, 0, 100)
+    end
+
+    ok, v = pcall(function() return ent:GetHealth() end)
+    if ok and type(v) == "number" then
+        return clamp(v, 0, 100)
+    end
+
+    return 0
+end
+
+local function get_local()
+    local ok, p = pcall(function() return entities.GetLocalPlayer() end)
+    if ok and p then return p end
+
+    ok, p = pcall(function() return entities.GetLocalPawn() end)
+    if ok and p then return p end
+
+    return nil
+end
+
+local function get_local_index()
+    local ok, idx = pcall(function() return client.GetLocalPlayerIndex() end)
+    if ok and idx and idx ~= 0 then
+        return idx
+    end
+    return 0
+end
+
+local function get_name_by_index(idx)
+    if not idx or idx == 0 then return "" end
+
+    local ok, name = pcall(function() return client.GetPlayerNameByIndex(idx) end)
+    if ok and name and name ~= "" then
+        return sanitize_name(name)
+    end
+
+    return ""
+end
+
+local function get_name_by_userid(uid)
+    if not uid or uid == 0 then return "" end
+
+    local ok, name = pcall(function() return client.GetPlayerNameByUserID(uid) end)
+    if ok and name and name ~= "" then
+        return sanitize_name(name)
+    end
+
+    return ""
+end
+
+local function ensure_player(name)
+    if not DB[name] then
+        DB[name] = { dmg = 0, kills = 0 }
+    end
+    return DB[name]
+end
+
+local function remember_player(name)
+    name = sanitize_name(name)
+    if name == "" then
+        return
+    end
+
+    if not SEEN_PLAYERS[name] then
+        SEEN_PLAYERS[name] = true
+        SEEN_ORDER[#SEEN_ORDER + 1] = name
+    end
+
+    if TEAM_HP[name] == nil then
+        TEAM_HP[name] = 100
+    end
+end
+
+local function handle_to_index(h)
+    if not h or h == 0 then
+        return 0
+    end
+
+    if h < 0 then
+        h = h + 4294967296
+    end
+
+    if h == 0xFFFFFFFF then
+        return 0
+    end
+
+    if bit_band then
+        return bit_band(h, 0x7FFF)
+    end
+
+    return h % 0x8000
+end
+
+local function resolve_entity_from_handle(h)
+    local idx = handle_to_index(h)
+    if idx == 0 then
+        return nil
+    end
+
+    local ok, ent = pcall(function() return entities.GetByIndex(idx) end)
+    if ok and ent then
+        return ent
+    end
+
+    return nil
+end
+
+local function resolve_entity_from_legacy_uid(uid)
+    if not uid or uid == 0 then
+        return nil
+    end
+
+    local ok, idx = pcall(function() return client.GetPlayerIndexByUserID(uid) end)
+    if not ok or not idx or idx == 0 then
+        return nil
+    end
+
+    local ok2, ent = pcall(function() return entities.GetByIndex(idx) end)
+    if ok2 and ent then
+        return ent
+    end
+
+    return nil
+end
+
+local function resolve_actor(uid, pawn_handle, allow_local_zero)
+    local pawn = resolve_entity_from_handle(pawn_handle)
+    if pawn then
+        local name = get_name_by_index(get_ent_index(pawn))
+        if name == "" then
+            name = get_name_by_userid(uid)
+        end
+        return pawn, name
+    end
+
+    local ent = resolve_entity_from_legacy_uid(uid)
+    if ent then
+        local name = get_name_by_index(get_ent_index(ent))
+        if name == "" then
+            name = get_name_by_userid(uid)
+        end
+        return ent, name
+    end
+
+    if allow_local_zero and (not uid or uid == 0) then
+        local me = get_local()
+        if not me then
+            return nil, ""
+        end
+
+        local local_name = get_name_by_index(get_local_index())
+        if local_name == "" then
+            local local_name2 = get_name_by_index(get_ent_index(me))
+            if local_name2 ~= "" then
+                local_name = local_name2
+            end
+        end
+        if local_name == "" then
+            local_name = "local"
+        end
+
+        return me, local_name
+    end
+
+    return nil, ""
+end
+
+local function is_same_actor(attacker_uid, victim_uid, attacker_pawn, victim_pawn, attacker_name, victim_name)
+    if attacker_uid ~= 0 and victim_uid ~= 0 and attacker_uid == victim_uid then
+        return true
+    end
+
+    local attacker_idx = get_ent_index(attacker_pawn)
+    local victim_idx = get_ent_index(victim_pawn)
+
+    if attacker_idx ~= 0 and victim_idx ~= 0 and attacker_idx == victim_idx then
+        return true
+    end
+
+    if attacker_name ~= "" and victim_name ~= "" and attacker_name == victim_name then
+        return true
+    end
+
+    return false
+end
+
+local function reset_visible_teammates_hp()
+    local me = get_local()
+    if not me then
+        return
+    end
+
+    local my_team = get_team(me)
+    if my_team == 0 then
+        return
+    end
+
+    local function push_from_list(list)
+        if not list then return end
+
+        for i = 1, #list do
+            local ent = list[i]
+            if ent and get_team(ent) == my_team then
+                local idx = get_ent_index(ent)
+                if idx ~= 0 then
+                    local name = get_name_by_index(idx)
+                    if name ~= "" then
+                        remember_player(name)
+                        TEAM_HP[name] = get_health(ent)
+                    end
+                end
+            end
+        end
+    end
+
+    local ok1, list1 = pcall(function() return entities.FindByClass("CCSPlayer") end)
+    if ok1 and list1 then push_from_list(list1) end
+
+    local ok2, list2 = pcall(function() return entities.FindByClass("CCSPlayerPawn") end)
+    if ok2 and list2 then push_from_list(list2) end
+
+    local ok3, list3 = pcall(function() return entities.FindByClass("C_CSPlayerPawn") end)
+    if ok3 and list3 then push_from_list(list3) end
+end
+
+local function refresh_seen_team_players()
+    local me = get_local()
+    if not me then
+        return
+    end
+
+    local my_team = get_team(me)
+    if my_team == 0 then
+        return
+    end
+
+    if LAST_LOCAL_TEAM ~= 0 and LAST_LOCAL_TEAM ~= my_team then
+        clear_seen()
+        clear_team_hp()
+    end
+    LAST_LOCAL_TEAM = my_team
+
+    local function push_from_list(list)
+        if not list then return end
+
+        for i = 1, #list do
+            local ent = list[i]
+            if ent and get_team(ent) == my_team then
+                local idx = get_ent_index(ent)
+                if idx ~= 0 then
+                    local name = get_name_by_index(idx)
+                    if name ~= "" then
+                        remember_player(name)
+                        TEAM_HP[name] = get_health(ent)
+                    end
+                end
+            end
+        end
+    end
+
+    local ok1, list1 = pcall(function() return entities.FindByClass("CCSPlayer") end)
+    if ok1 and list1 then push_from_list(list1) end
+
+    local ok2, list2 = pcall(function() return entities.FindByClass("CCSPlayerPawn") end)
+    if ok2 and list2 then push_from_list(list2) end
+
+    local ok3, list3 = pcall(function() return entities.FindByClass("C_CSPlayerPawn") end)
+    if ok3 and list3 then push_from_list(list3) end
+end
+
+local function compute_real_damage(victim_name, dmg_health, health_after)
+    local after = tonumber(health_after) or 0
+    local raw = tonumber(dmg_health) or 0
+
+    if after < 0 then after = 0 end
+    if after > 100 then after = 100 end
+
+    local prev = TEAM_HP[victim_name]
+    if prev == nil then
+        prev = after + raw
+        if prev > 100 then prev = 100 end
+        if prev < after then prev = 100 end
+    end
+
+    if after > prev then
+        prev = 100
+    end
+
+    local real = prev - after
+    if real < 0 then real = 0 end
+    if real > prev then real = prev end
+
+    TEAM_HP[victim_name] = after
+    return real
+end
+
+local function count_team_hurt(event)
+    local me = get_local()
+    if not me then return end
+
+    local my_team = get_team(me)
+    if my_team == 0 then return end
+
+    local attacker_uid = safe_getint(event, "attacker")
+    local victim_uid   = safe_getint(event, "userid")
+    local dmg_health   = safe_getint(event, "dmg_health")
+    local health_after = safe_getint(event, "health")
+    local attacker_ph  = safe_getint(event, "attacker_pawn")
+    local victim_ph    = safe_getint(event, "userid_pawn")
+
+    if victim_uid == 0 then return end
+    if dmg_health <= 0 then return end
+
+    local attacker_pawn, attacker_name = resolve_actor(attacker_uid, attacker_ph, true)
+    local victim_pawn, victim_name     = resolve_actor(victim_uid, victim_ph, false)
+
+    if not victim_pawn or victim_name == "" then
+        return
+    end
+
+    if get_team(victim_pawn) ~= my_team then
+        return
+    end
+
+    remember_player(victim_name)
+
+    local real_dmg = compute_real_damage(victim_name, dmg_health, health_after)
+
+    if not attacker_pawn or attacker_name == "" then
+        return
+    end
+
+    if is_same_actor(attacker_uid, victim_uid, attacker_pawn, victim_pawn, attacker_name, victim_name) then
+        return
+    end
+
+    if get_team(attacker_pawn) ~= my_team then
+        return
+    end
+
+    remember_player(attacker_name)
+
+    if real_dmg <= 0 then
+        return
+    end
+
+    local row_data = ensure_player(attacker_name)
+    row_data.dmg = (tonumber(row_data.dmg) or 0) + real_dmg
+    save_db()
+end
+
+local function count_team_kill(event)
+    local me = get_local()
+    if not me then return end
+
+    local my_team = get_team(me)
+    if my_team == 0 then return end
+
+    local attacker_uid = safe_getint(event, "attacker")
+    local victim_uid   = safe_getint(event, "userid")
+    local attacker_ph  = safe_getint(event, "attacker_pawn")
+    local victim_ph    = safe_getint(event, "userid_pawn")
+
+    if victim_uid == 0 then return end
+
+    local attacker_pawn, attacker_name = resolve_actor(attacker_uid, attacker_ph, true)
+    local victim_pawn, victim_name     = resolve_actor(victim_uid, victim_ph, false)
+
+    if victim_name ~= "" then
+        TEAM_HP[victim_name] = 0
+    end
+
+    if not victim_pawn or victim_name == "" then
+        return
+    end
+
+    if get_team(victim_pawn) ~= my_team then
+        return
+    end
+
+    if not attacker_pawn or attacker_name == "" then
+        return
+    end
+
+    if is_same_actor(attacker_uid, victim_uid, attacker_pawn, victim_pawn, attacker_name, victim_name) then
+        return
+    end
+
+    if get_team(attacker_pawn) ~= my_team then
+        return
+    end
+
+    remember_player(attacker_name)
+    remember_player(victim_name)
+
+    local row_data = ensure_player(attacker_name)
+    row_data.kills = (tonumber(row_data.kills) or 0) + 1
+    save_db()
+end
+
+pcall(function() client.AllowListener("player_hurt") end)
+pcall(function() client.AllowListener("player_death") end)
+pcall(function() client.AllowListener("round_freeze_end") end)
+pcall(function() client.AllowListener("round_start") end)
+pcall(function() client.AllowListener("game_newmap") end)
+pcall(function() client.AllowListener("cs_game_disconnected") end)
+
+callbacks.Register("FireGameEvent", "gt_event", function(event)
+    if not event then return end
+
+    local name = event:GetName()
+    if not name then return end
+
+    if name == "game_newmap" or name == "cs_game_disconnected" then
+        freeze_end_time = 0.0
+        clear_seen()
+        clear_team_hp()
+        return
+    end
+
+    if name == "round_start" then
+        freeze_end_time = 0.0
+        refresh_seen_team_players()
+        reset_visible_teammates_hp()
+        return
+    end
+
+    if name == "round_freeze_end" then
+        freeze_end_time = realtime() + 8.0
+        refresh_seen_team_players()
+        reset_visible_teammates_hp()
+        return
+    end
+
+    if name == "player_hurt" then
+        count_team_hurt(event)
+        return
+    end
+
+    if name == "player_death" then
+        count_team_kill(event)
+        return
+    end
+end)
+
+local function collect_rows()
+    refresh_seen_team_players()
+
+    local rows = {}
+    for i = 1, #SEEN_ORDER do
+        local name = SEEN_ORDER[i]
+        local st = DB[name] or { dmg = 0, kills = 0 }
+
+        rows[#rows + 1] = {
+            name = name,
+            dmg = tonumber(st.dmg) or 0,
+            kills = tonumber(st.kills) or 0
+        }
+    end
+
+    table.sort(rows, function(a, b)
+        if a.kills ~= b.kills then return a.kills > b.kills end
+        if a.dmg ~= b.dmg then return a.dmg > b.dmg end
+        return a.name:lower() < b.name:lower()
+    end)
+
+    return rows
+end
+
+callbacks.Register("Draw", "gt_draw", function()
+    if menu then
+        local ok, active = pcall(function() return menu:IsActive() end)
+        wnd:SetInvisible(not (ok and active))
+    end
+
+    if not gt_on:GetValue() then return end
+
+    local me = get_local()
+    if not me then
+        return
+    end
+
+    local my_team = get_team(me)
+    if my_team == 0 then
+        return
+    end
+
+    local x = gt_x:GetValue()
+    local y = gt_y:GetValue()
+    local w = 340
+    local row_h = 24
+
+    local time_left = freeze_end_time - realtime()
+
+    draw.SetFont(font)
+
+    if time_left > 0 then
+        draw.Color(255, 50, 50, 255)
+        draw.Text(x, y - 18, string.format("Grief Cooldown: %.1f sec... | DONT SHOOT!", time_left))
+    else
+        draw.Color(50, 255, 50, 255)
+        draw.Text(x, y - 18, "No Grief Cooldown | Can Shoot")
+    end
+
+    draw.Color(25, 20, 20, 220)
+    draw.FilledRect(x, y, x + w, y + row_h)
+
+    draw.Color(220, 220, 220, 255)
+    draw.Text(x + 8, y + 5, "Name")
+    draw.Text(x + 150, y + 5, "Team Dmg")
+    draw.Text(x + 250, y + 5, "Team Kills")
+
+    local rows = collect_rows()
+    local off = row_h
+
+    for i = 1, #rows do
+        local r = rows[i]
+        local y1 = y + off
+        local y2 = y1 + row_h
+
+        if i % 2 == 0 then
+            draw.Color(55, 40, 30, 210)
+        else
+            draw.Color(45, 30, 20, 210)
+        end
+        draw.FilledRect(x, y1, x + w, y2)
+
+        draw.Color(0, 180, 220, 255)
+        draw.Text(x + 8, y1 + 4, r.name)
+
+        local dmg_ratio = clamp(r.dmg / 300, 0, 1)
+        local dr, dg, db = 50, 200, 50
+        if dmg_ratio > 0.66 then
+            dr, dg, db = 220, 50, 50
+        elseif dmg_ratio > 0.33 then
+            dr, dg, db = 200, 200, 50
+        end
+
+        draw.Color(dr, dg, db, 255)
+        draw.FilledRect(x + 150, y1 + 6, x + 160, y1 + 16)
+
+        draw.Color(255, 255, 255, 255)
+        draw.Text(x + 170, y1 + 4, string.format("%d/300", r.dmg))
+
+        local kill_ratio = clamp(r.kills / 3, 0, 1)
+        local kr, kg, kb = 50, 200, 50
+        if kill_ratio >= 0.66 then
+            kr, kg, kb = 220, 50, 50
+        elseif kill_ratio >= 0.33 then
+            kr, kg, kb = 200, 200, 50
+        end
+
+        draw.Color(kr, kg, kb, 255)
+        draw.FilledRect(x + 250, y1 + 6, x + 260, y1 + 16)
+
+        draw.Color(255, 255, 255, 255)
+        draw.Text(x + 270, y1 + 4, string.format("%d/3", r.kills))
+
+        off = off + row_h
+    end
+end)
+
+callbacks.Register("Unload", "gt_unload", function()
+    save_db()
+    callbacks.Unregister("FireGameEvent", "gt_event")
+    callbacks.Unregister("Draw", "gt_draw")
+end)
