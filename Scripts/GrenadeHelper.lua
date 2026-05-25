@@ -36,8 +36,8 @@ local GH = {
     TWO_PI = 6.28318530718,
     
     SAVE_FILE = "grenade_helper_data.dat",
-    DATA_URL = "https://raw.githubusercontent.com/Anybody4506/AMWRV6/refs/heads/main/Grenade%20Helper/grenade_helper_data.dat",
-    SCRIPT_URL = "https://raw.githubusercontent.com/Anybody4506/AMWRV6/refs/heads/main/Grenade%20Helper/Grenade%20Helper.lua",
+    DATA_URL = "https://raw.githubusercontent.com/julio51ebpender/AIMWARE/refs/heads/main/Maps/grenade_helper_data.dat",
+    SCRIPT_URL = "https://raw.githubusercontent.com/julio51ebpender/AIMWARE/refs/heads/main/Scripts/GrenadeHelper.lua",
     SCRIPT_NAME = "Grenade Helper.lua",
     
     IN_FORWARD = bit_lshift(1, 3),
